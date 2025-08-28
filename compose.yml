@@ -1,0 +1,11 @@
+# compose.yaml
+services:
+  ids:
+    image: hypertime-ids-alert
+    env_file: .env
+    pid: host
+    network_mode: host
+    read_only: true
+    cap_drop: [ "ALL" ]
+    security_opt:
+      - no-new-privileges:true
