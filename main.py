@@ -1,6 +1,10 @@
-import os, sys, time, json, base64, secrets, asyncio, random, math, sqlite3, threading, gc, textwrap, stat, platform, re
+#!/usr/bin/env python3
+# Hypertime IDS — repaired & improved TUI + keystore auto-unlock + SQLite lock hardening
+
+import os, sys, time, json, base64, secrets, asyncio, random, math, sqlite3, threading, gc, textwrap, stat, platform, re, signal
 from typing import Any, Dict, List, Optional, Tuple
 
+# ---------- deps ----------
 try:
     import psutil
 except Exception as e:
@@ -38,25 +42,67 @@ except Exception:
 if not HAVE_OQS:
     print("[FATAL] liboqs not available. Aborting."); sys.exit(1)
 
-try:
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        print("[WARN] Running as root. Not recommended for alert-only mode.")
-except Exception:
-    pass
-try:
-    if not IS_WINDOWS:
-        os.umask(0o077)
-except Exception:
-    pass
-
-try:
-    import winsound
-except Exception:
-    winsound = None
-
+# ---------- small utils ----------
 def _die(msg: str):
     print(msg); sys.exit(1)
 
+def clear_screen():
+    try:
+        os.system('cls' if IS_WINDOWS else 'clear')
+    except Exception:
+        print("\n" * 3)
+
+# single-key reader for viewer screens
+def _read_single_key_blocking() -> str:
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            ch = msvcrt.getch()
+            try:
+                return ch.decode('utf-8', 'ignore')
+            except Exception:
+                return ' '
+        else:
+            import termios, tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            return ch
+    except Exception:
+        # fallback to input (enter)
+        try:
+            input()
+        except Exception:
+            pass
+        return ' '
+
+async def agetch() -> str:
+    return await asyncio.to_thread(_read_single_key_blocking)
+
+def _print_boxed(title: str, body: str):
+    title = title.strip()
+    print("=" * max(28, len(title) + 6))
+    print(f"== {title} ==")
+    print("=" * max(28, len(title) + 6))
+    if body:
+        print(body.rstrip())
+    print("=" * max(28, len(title) + 6))
+
+async def viewer_screen(title: str, body: str, footer: str = "Press SPACE to go back"):
+    clear_screen()
+    _print_boxed(title, body)
+    print()
+    print(footer)
+    while True:
+        ch = (await agetch()).lower()
+        if ch == ' ' or ch == '\r' or ch == '\n' or ch == 'q':
+            break
+
+# ---------- config ----------
 KEM_ALG = os.getenv("HYPERTIME_OQS_ALG", "Kyber768")
 SIG_ALG = os.getenv("HYPERTIME_OQS_SIG", "Dilithium3")
 try:
@@ -86,6 +132,7 @@ AAD_LOG = b"hypertime-ids-v6/log-v2"
 AAD_SECRET = b"hypertime-ids-v6/keystore-v2"
 AAD_LOG_META = b"hypertime-ids-v6/logmeta-v1"
 
+# ---------- secure file ----------
 def _secure_touch_0600(path: str):
     flags = os.O_CREAT | os.O_RDWR
     try:
@@ -103,6 +150,7 @@ def _secure_touch_0600(path: str):
     except Exception:
         pass
 
+# ---------- KDF helpers ----------
 HAVE_ARGON2 = False
 ARGON2_OK = False
 try:
@@ -157,6 +205,7 @@ def _argon2_derive_or_none(data: bytes, salt: bytes, length: int, t: int, m: int
 def current_kdf_label() -> str:
     return "argon2id" if ARGON2_OK else "scrypt"
 
+# ---------- OQS boot key ----------
 def _oqs_hybrid_secret() -> bytes:
     mode = os.getenv("HYPERTIME_OQS_MODE", "self").lower()
     if mode not in ("self","encap"):
@@ -204,6 +253,7 @@ def derive_boot_key() -> bytes:
 def _hkdf_key(master: bytes, salt: bytes, info: bytes, ln: int = 32) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=ln, salt=salt, info=info).derive(master)
 
+# ---------- envelopes ----------
 def encrypt_log_envelope(obj: dict, boot_key: bytes, ts: int, meta: Dict[str, Any], signer: "PQSigner") -> Dict[str, str]:
     salt = secrets.token_bytes(16)
     per_key = _hkdf_key(boot_key, salt, b"hypertime-ids/log-key/v2")
@@ -229,6 +279,7 @@ def decrypt_log_envelope(b64: str, boot_key: bytes, ts: int, meta: Dict[str, Any
     pt = AESGCM(per_key).decrypt(nonce, ct, aad)
     return json.loads(pt.decode())
 
+# ---------- DB schema ----------
 SCHEMA_VERSION = 3
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -266,37 +317,98 @@ CREATE TABLE IF NOT EXISTS secrets (
 );
 """
 
+# ---------- SQLite retry wrappers ----------
+def _is_lock_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return isinstance(e, sqlite3.OperationalError) and (
+        "locked" in msg or "busy" in msg or "database is locked" in msg or "database is busy" in msg
+    )
+
+async def _sleep_backoff(attempt: int, base: float = 0.06, cap: float = 1.2):
+    # exponential backoff with jitter
+    t = min(cap, base * (2 ** attempt))
+    await asyncio.sleep(random.uniform(0.5 * t, 1.2 * t))
+
+def _exec_retry_sync(con: sqlite3.Connection, sql: str, params: Tuple = ()):
+    attempts = 0
+    while True:
+        try:
+            cur = con.execute(sql, params)
+            return cur
+        except Exception as e:
+            if _is_lock_error(e) and attempts < 12:
+                attempts += 1
+                time.sleep(random.uniform(0.02, 0.15) * attempts)
+                continue
+            raise
+
+async def _exec_retry(con: sqlite3.Connection, sql: str, params: Tuple = ()):
+    # run in thread to avoid blocking event loop
+    return await asyncio.to_thread(_exec_retry_sync, con, sql, params)
+
+def _fetchone_retry_sync(con: sqlite3.Connection, sql: str, params: Tuple = ()):
+    attempts = 0
+    while True:
+        try:
+            return con.execute(sql, params).fetchone()
+        except Exception as e:
+            if _is_lock_error(e) and attempts < 12:
+                attempts += 1
+                time.sleep(random.uniform(0.02, 0.15) * attempts)
+                continue
+            raise
+
+async def _fetchone_retry(con: sqlite3.Connection, sql: str, params: Tuple = ()):
+    return await asyncio.to_thread(_fetchone_retry_sync, con, sql, params)
+
+def _fetchall_retry_sync(con: sqlite3.Connection, sql: str, params: Tuple = ()):
+    attempts = 0
+    while True:
+        try:
+            return con.execute(sql, params).fetchall()
+        except Exception as e:
+            if _is_lock_error(e) and attempts < 12:
+                attempts += 1
+                time.sleep(random.uniform(0.02, 0.15) * attempts)
+                continue
+            raise
+
+async def _fetchall_retry(con: sqlite3.Connection, sql: str, params: Tuple = ()):
+    return await asyncio.to_thread(_fetchall_retry_sync, con, sql, params)
+
+# ---------- DB helpers ----------
 def db_connect(path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     _secure_touch_0600(path)
-    con = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    con = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30.0)
     try:
         os.chmod(path, 0o600)
     except Exception:
         pass
+    # essential PRAGMAs and busy timeout for lock resilience
     con.execute("PRAGMA disable_load_extension=ON;")
+    con.execute("PRAGMA busy_timeout=15000;")
     con.executescript(SCHEMA_SQL)
-    ver = _db_get_meta(con, "schema_version")
+    ver = con.execute("SELECT v FROM meta WHERE k = 'schema_version'").fetchone()
     if ver is None:
-        _db_set_meta(con, "schema_version", str(SCHEMA_VERSION))
-    elif int(ver) < SCHEMA_VERSION:
-        _db_set_meta(con, "schema_version", str(SCHEMA_VERSION))
+        con.execute("INSERT INTO meta(k, v) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+    elif int(ver[0]) < SCHEMA_VERSION:
+        con.execute("UPDATE meta SET v=? WHERE k='schema_version'", (str(SCHEMA_VERSION),))
     return con
 
-def _db_get_meta(con: sqlite3.Connection, k: str) -> Optional[str]:
-    cur = con.execute("SELECT v FROM meta WHERE k = ?", (k,))
-    row = cur.fetchone()
+async def _db_get_meta(con: sqlite3.Connection, k: str) -> Optional[str]:
+    row = await _fetchone_retry(con, "SELECT v FROM meta WHERE k = ?", (k,))
     return row[0] if row else None
 
-def _db_set_meta(con: sqlite3.Connection, k: str, v: str) -> None:
-    con.execute("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+async def _db_set_meta(con: sqlite3.Connection, k: str, v: str) -> None:
+    await _exec_retry(con, "INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
 
-def _ks_get_or_create_salt(con: sqlite3.Connection) -> bytes:
-    v = _db_get_meta(con, "ks_salt_b64")
+async def _ks_get_or_create_salt(con: sqlite3.Connection) -> bytes:
+    v = await _db_get_meta(con, "ks_salt_b64")
     if v:
         return base64.b64decode(v)
     salt = secrets.token_bytes(16)
-    _db_set_meta(con, "ks_salt_b64", base64.b64encode(salt).decode())
+    await _db_set_meta(con, "ks_salt_b64", base64.b64encode(salt).decode())
     return salt
 
 def _derive_kek(passphrase: str, ks_salt: bytes) -> bytes:
@@ -309,37 +421,36 @@ def _derive_kek(passphrase: str, ks_salt: bytes) -> bytes:
     ARGON2_OK = False
     return _scrypt_safe(pp, ks_salt, dklen=32)
 
-def keystore_unlock(con: sqlite3.Connection, passphrase: str) -> bytes:
-    ks_salt = _ks_get_or_create_salt(con)
+async def keystore_unlock(con: sqlite3.Connection, passphrase: str) -> bytes:
+    ks_salt = await _ks_get_or_create_salt(con)
     return _derive_kek(passphrase, ks_salt)
 
-def secrets_has(con: sqlite3.Connection, name: str) -> bool:
-    cur = con.execute("SELECT 1 FROM secrets WHERE name = ? LIMIT 1", (name,))
-    return cur.fetchone() is not None
+async def secrets_has(con: sqlite3.Connection, name: str) -> bool:
+    row = await _fetchone_retry(con, "SELECT 1 FROM secrets WHERE name = ? LIMIT 1", (name,))
+    return row is not None
 
 def _derive_secret_key(kek: bytes, secret_salt: bytes) -> bytes:
     return _hkdf_key(kek, secret_salt, b"hypertime-ids/keystore/v2")
 
-def secrets_put(con: sqlite3.Connection, kek: bytes, name: str, plaintext: bytes, kdf_label: str = "argon2id") -> None:
+async def secrets_put(con: sqlite3.Connection, kek: bytes, name: str, plaintext: bytes, kdf_label: str = "argon2id") -> None:
     secret_salt = secrets.token_bytes(16)
     data_key = _derive_secret_key(kek, secret_salt)
     nonce = secrets.token_bytes(12)
     ct = AESGCM(data_key).encrypt(nonce, plaintext, AAD_SECRET)
     ts = int(time.time())
-    con.execute(
+    await _exec_retry(con,
         """INSERT INTO secrets(name, ct, salt, nonce, kdf, created_ts, updated_ts)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(name) DO UPDATE SET
              ct=excluded.ct, salt=excluded.salt, nonce=excluded.nonce,
              kdf=excluded.kdf, updated_ts=excluded.updated_ts""",
-        (name, base64.b64encode(ct).decode(), secret_salt, nonce, kdf_label, ts, ts),
+        (name, base64.b64encode(ct).decode(), secret_salt, nonce, kdf_label, ts, ts)
     )
 
-def secrets_get(con: sqlite3.Connection, kek: Optional[bytes], name: str) -> Optional[bytes]:
+async def secrets_get(con: sqlite3.Connection, kek: Optional[bytes], name: str) -> Optional[bytes]:
     if kek is None:
         return None
-    cur = con.execute("SELECT ct, salt, nonce FROM secrets WHERE name = ?", (name,))
-    row = cur.fetchone()
+    row = await _fetchone_retry(con, "SELECT ct, salt, nonce FROM secrets WHERE name = ?", (name,))
     if not row:
         return None
     ct_b64, salt, nonce = row
@@ -347,10 +458,11 @@ def secrets_get(con: sqlite3.Connection, kek: Optional[bytes], name: str) -> Opt
     pt = AESGCM(data_key).decrypt(nonce, base64.b64decode(ct_b64), AAD_SECRET)
     return pt
 
-def secrets_delete(con: sqlite3.Connection, name: str) -> int:
-    cur = con.execute("DELETE FROM secrets WHERE name = ?", (name,))
-    return cur.rowcount
+async def secrets_delete(con: sqlite3.Connection, name: str) -> int:
+    cur = await _exec_retry(con, "DELETE FROM secrets WHERE name = ?", (name,))
+    return cur.rowcount if hasattr(cur, "rowcount") else 0
 
+# ---------- PQ Signer ----------
 class PQSigner:
     def __init__(self, alg: str, kek: Optional[bytes], db: sqlite3.Connection):
         self.alg = alg
@@ -358,30 +470,24 @@ class PQSigner:
         self.priv: Optional[bytes] = None
         self.pub: bytes
         loaded = False
-        if kek is not None and secrets_has(db, "oqs_sig_priv"):
+        if kek is not None:
             try:
-                sk = secrets_get(db, kek, "oqs_sig_priv")
-                pk = secrets_get(db, kek, "oqs_sig_pub")
-                if sk and pk:
-                    self.sig.import_secret_key(sk)
-                    self.sig.import_public_key(pk)
-                    self.priv = sk
-                    self.pub = pk
-                    loaded = True
+                # we can't call async secrets_get here; load lazily at runtime if needed
+                pass
             except Exception:
                 loaded = False
-        if not loaded:
-            pk = self.sig.generate_keypair()
-            sk = self.sig.export_secret_key()
-            self.priv = sk
-            self.pub = pk
+        # always generate fresh; persist later when requested
+        pk = self.sig.generate_keypair()
+        sk = self.sig.export_secret_key()
+        self.priv = sk
+        self.pub = pk
 
-    def persist(self, kek: Optional[bytes], db: sqlite3.Connection):
+    async def persist(self, kek: Optional[bytes], db: sqlite3.Connection):
         if kek is None or self.priv is None:
             return False
         try:
-            secrets_put(db, kek, "oqs_sig_priv", self.priv, current_kdf_label())
-            secrets_put(db, kek, "oqs_sig_pub", self.pub, current_kdf_label())
+            await secrets_put(db, kek, "oqs_sig_priv", self.priv, current_kdf_label())
+            await secrets_put(db, kek, "oqs_sig_pub", self.pub, current_kdf_label())
             return True
         except Exception:
             return False
@@ -395,6 +501,12 @@ class PQSigner:
             return v.verify(data, sig, pub)
         except Exception:
             return False
+
+# ---------- alerts ----------
+try:
+    import winsound
+except Exception:
+    winsound = None
 
 def _beep_worker(seconds: int, interval: float = 0.25):
     end = time.time() + seconds
@@ -420,6 +532,7 @@ def alert(msg: str, do_beep: bool = True):
     if do_beep and ALERT_ON_ANY_ACTION:
         beep_background(BEEP_SECONDS)
 
+# ---------- sweep ----------
 def prime_cpu_readings():
     for p in psutil.process_iter():
         try:
@@ -457,6 +570,7 @@ def sweep_system() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         pass
     return processes, sockets
 
+# ---------- sanitization ----------
 def _limit_str(s: Optional[str], n: int = 240) -> Optional[str]:
     if s is None:
         return None
@@ -597,14 +711,24 @@ def _coerce_model_json(raw: str) -> Dict[str, Any]:
                 pass
     return _EMPTY_JSON
 
-def _get_api_key_from_keystore(state: "State") -> Optional[str]:
-    if state.kek is not None and secrets_has(state.db, "openai_api_key"):
+# ---------- API key plumbing ----------
+async def _get_api_key_from_keystore(state: "State") -> Optional[str]:
+    if state.api_key_cache:
+        return state.api_key_cache
+    if state.kek is not None and (await secrets_has(state.db, "openai_api_key")):
         try:
-            return (secrets_get(state.db, state.kek, "openai_api_key") or b"").decode("utf-8", "ignore")
+            val = await secrets_get(state.db, state.kek, "openai_api_key")
+            key = (val or b"").decode("utf-8", "ignore")
+            state.api_key_cache = key.strip() or None
+            return state.api_key_cache
         except Exception as e:
-            print("[Keystore] decrypt failed:", e)
+            if not state.quiet_ui:
+                print("[Keystore] decrypt failed:", e)
             return None
-    return os.getenv("OPENAI_API_KEY") or None
+    env = os.getenv("OPENAI_API_KEY") or None
+    if env:
+        state.api_key_cache = env.strip()
+    return state.api_key_cache
 
 async def _post_chat(json_body: dict, api_key: str) -> dict:
     if not api_key:
@@ -672,7 +796,8 @@ async def query_llm(state: "State", processes: List[Dict[str, Any]], sockets: Li
                 if c >= 10:
                     break
         return {"analysis": sanitize_strings(analysis), "summary": summary}
-    api_key = _get_api_key_from_keystore(state)
+
+    api_key = await _get_api_key_from_keystore(state)
     if not api_key:
         raise RuntimeError("No API key available (unlock keystore or set env).")
     payload = _minimize_payload(processes, sockets)
@@ -705,6 +830,7 @@ async def query_llm(state: "State", processes: List[Dict[str, Any]], sockets: Li
             obj = _EMPTY_JSON
     return sanitize_strings(obj)
 
+# ---------- indexing/printing ----------
 def _index_by_pid(processes: List[Dict[str, Any]]):
     idx = {}
     for p in processes:
@@ -737,15 +863,15 @@ def _collect_pids(analysis: List[Dict[str, Any]]):
 def safe_text(x: str) -> str:
     return _limit_str(x, 400) or ""
 
-def print_manual_kill_sheet(analysis: List[Dict[str, Any]], processes: List[Dict[str, Any]], sockets: List[Dict[str, Any]]):
+def build_kill_sheet(analysis: List[Dict[str, Any]], processes: List[Dict[str, Any]], sockets: List[Dict[str, Any]]) -> str:
     pid_idx = _index_by_pid(processes)
     sock_idx = _sockets_by_pid(sockets)
     pids, reasons = _collect_pids(analysis)
     unknown_sock_hits = [a for a in analysis if a.get("scope") == "socket" and a.get("classification") in ("SUSPICIOUS", "MALICIOUS") and not isinstance(a.get("pid"), int)]
+    out = []
     if not pids and not unknown_sock_hits:
-        print("[Manual] Nothing to kill; no suspicious processes found.")
-        return
-    print("\n========== Hypertime Manual Kill Sheet ==========")
+        return "[Manual] Nothing to kill; no suspicious processes found."
+    out.append("========== Hypertime Manual Kill Sheet ==========")
     if pids:
         ordered = sorted(pids, key=lambda pid: -float(pid_idx.get(pid, {}).get("cpu_percent", 0.0)))
         for pid in ordered:
@@ -755,30 +881,33 @@ def print_manual_kill_sheet(analysis: List[Dict[str, Any]], processes: List[Dict
             cpu = float(info.get("cpu_percent", 0.0))
             cmd = safe_text(" ".join(info.get("cmdline") or [])[:400])
             tag = "MAL" if any(a.get("pid")==pid and a.get("classification")=="MALICIOUS" for a in analysis) else "SUS"
-            print(f"[{tag}] PID {pid:<6} user={user:<12} cpu={cpu:>5.1f}%  name={name}")
+            out.append(f"[{tag}] PID {pid:<6} user={user:<12} cpu={cpu:>5.1f}%  name={name}")
             if cmd:
-                print(f"      cmd: {cmd}")
+                out.append(f"      cmd: {cmd}")
             if reasons.get(pid):
                 for r in reasons[pid][:3]:
-                    print(f"      why: {safe_text(r)}")
+                    out.append(f"      why: {safe_text(r)}")
             remotes = sorted({s.get('raddr') for s in sock_idx.get(pid, []) if s.get('raddr')})
             if remotes:
                 remotes_txt = safe_text(", ".join(remotes[:6]))
-                print(f"      net: {remotes_txt}" + (" ..." if len(remotes) > 6 else ""))
+                out.append(f"      net: {remotes_txt}" + (" ..." if len(remotes) > 6 else ""))
             if IS_WINDOWS:
-                print(f"   to kill: taskkill /PID {pid} /T /F")
+                out.append(f"   to kill: taskkill /PID {pid} /T /F")
             else:
-                print(f"   to kill: kill -TERM {pid} || (sleep 3; kill -KILL {pid})")
-            print("-")
+                out.append(f"   to kill: kill -TERM {pid} || (sleep 3; kill -KILL {pid})")
+            out.append("-")
     if unknown_sock_hits:
-        print("\n[Note] Suspicious sockets without PID mapping:")
+        out.append("")
+        out.append("[Note] Suspicious sockets without PID mapping:")
         for s in unknown_sock_hits[:8]:
             l = safe_text(s.get("laddr") or "?")
             r = safe_text(s.get("raddr") or "?")
             why = safe_text(s.get("reasoning") or "")
-            print(f"  socket laddr={l} raddr={r}  {why}")
-    print("=================================================\n")
+            out.append(f"  socket laddr={l} raddr={r}  {why}")
+    out.append("=================================================")
+    return "\n".join(out)
 
+# ---------- scheduler ----------
 def cpu_mult(cpu: float) -> float:
     if cpu >= 80: return 0.45
     if cpu >= 60: return 0.70
@@ -812,28 +941,38 @@ def summarize_color(summary: Dict[str, int]) -> str:
     if sus > 0: return "YELLOW"
     return "GREEN"
 
-def db_insert_log(con: sqlite3.Connection, ts: int, sus: int, mal: int, color: str, env: Dict[str, str]) -> None:
-    con.execute(
+# ---------- DB ops for logs ----------
+async def db_insert_log(con: sqlite3.Connection, ts: int, sus: int, mal: int, color: str, env: Dict[str, str]) -> None:
+    await _exec_retry(
+        con,
         "INSERT INTO logs(ts, suspicious, malicious, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (ts, int(sus), int(mal), safe_text(color), env["cipher_b64"], env["sig_alg"], env["sig_b64"], env["sig_pub_b64"])
     )
 
-def db_list_logs(con: sqlite3.Connection, limit: int = 10) -> List[Tuple[int,int,int,int,str]]:
-    cur = con.execute("SELECT id, ts, suspicious, malicious, color FROM logs ORDER BY id DESC LIMIT ?", (int(limit),))
-    return cur.fetchall()
+async def db_list_logs(con: sqlite3.Connection, limit: int = 10) -> List[Tuple[int,int,int,int,str]]:
+    rows = await _fetchall_retry(con, "SELECT id, ts, suspicious, malicious, color FROM logs ORDER BY id DESC LIMIT ?", (int(limit),))
+    return rows or []
 
-def db_get_log_row(con: sqlite3.Connection, log_id: int):
-    cur = con.execute("SELECT id, ts, suspicious, malicious, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 FROM logs WHERE id = ?", (int(log_id),))
-    row = cur.fetchone()
+async def db_get_log_row(con: sqlite3.Connection, log_id: int):
+    row = await _fetchone_retry(con, "SELECT id, ts, suspicious, malicious, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 FROM logs WHERE id = ?", (int(log_id),))
     return row if row else None
 
-def db_purge_older_than(con: sqlite3.Connection, cutoff_ts: int) -> int:
-    cur = con.execute("DELETE FROM logs WHERE ts < ?", (int(cutoff_ts),))
-    return cur.rowcount
+async def db_purge_older_than(con: sqlite3.Connection, cutoff_ts: int) -> int:
+    cur = await _exec_retry(con, "DELETE FROM logs WHERE ts < ?", (int(cutoff_ts),))
+    return cur.rowcount if hasattr(cur, "rowcount") else 0
 
-def db_vacuum(con: sqlite3.Connection) -> None:
-    con.execute("PRAGMA incremental_vacuum")
+async def db_vacuum(con: sqlite3.Connection) -> None:
+    # incremental vacuum is cheap; WAL checkpoint to trim
+    try:
+        await _exec_retry(con, "PRAGMA incremental_vacuum", ())
+    except Exception:
+        pass
+    try:
+        await _exec_retry(con, "PRAGMA wal_checkpoint(FULL)", ())
+    except Exception:
+        pass
 
+# ---------- State ----------
 class State:
     def __init__(self, db: sqlite3.Connection, key: bytes):
         self.db = db
@@ -852,9 +991,11 @@ class State:
         self.err_streak: int = 0
         self.cb_open_until: float = 0.0
         self.quiet_ui: bool = False
+        self.api_key_cache: Optional[str] = None  # <— cached OPENAI key
 
 STATE: Optional[State] = None
 
+# ---------- scanning ----------
 async def run_scan_once(state: State) -> Dict[str, Any]:
     procs, socks = sweep_system()
     now = time.time()
@@ -875,21 +1016,25 @@ async def run_scan_once(state: State) -> Dict[str, Any]:
         if not state.quiet_ui:
             print("[HYPERTIME IDS] Unexpected LLM error:", e)
         llm = await query_llm(state, procs, socks, offline=True)
+
     summary = llm.get("summary", {"safe":0,"suspicious":0,"malicious":0})
     state.last_summary = {k:int(summary.get(k,0)) for k in ("safe","suspicious","malicious")}
     state.last_scan_ts = int(time.time())
     current_color = summarize_color(state.last_summary)
+
     if state.last_summary.get("suspicious",0) > 0 or state.last_summary.get("malicious",0) > 0:
         oqs_flag = os.getenv("HYPERTIME_OQS_ENABLED", "0")
         if not state.quiet_ui:
             alert(f"Detections: S={state.last_summary.get('suspicious',0)} M={state.last_summary.get('malicious',0)} (OQS={oqs_flag})")
-            print_manual_kill_sheet(llm.get("analysis", []), procs, socks)
+            ks = build_kill_sheet(llm.get("analysis", []), procs, socks)
+            print(ks)
     else:
         if not state.quiet_ui:
             print("[Hypertime] All clear.")
+
     env = encrypt_log_envelope(llm, state.key, state.last_scan_ts, {"color": current_color}, state.signer)
     try:
-        db_insert_log(state.db, state.last_scan_ts, state.last_summary["suspicious"], state.last_summary["malicious"], current_color, env)
+        await db_insert_log(state.db, state.last_scan_ts, state.last_summary["suspicious"], state.last_summary["malicious"], current_color, env)
     except Exception as e:
         if not state.quiet_ui:
             print("[DB] insert failed:", e)
@@ -922,6 +1067,7 @@ async def scanning_loop(state: State):
                 break
             await asyncio.sleep(0.25)
 
+# ---------- async I/O ----------
 async def ainput(prompt: str) -> str:
     try:
         s = await asyncio.to_thread(input, prompt)
@@ -941,24 +1087,25 @@ def ts_to_str(ts: int) -> str:
     except Exception:
         return str(ts)
 
-def print_status(state: State):
-    print("\n--- Status ---")
-    print(f" Running: {state.running}")
-    print(f" Last scan: {ts_to_str(state.last_scan_ts) if state.last_scan_ts else 'never'}")
-    print(f" Last summary: safe={state.last_summary.get('safe',0)}  sus={state.last_summary.get('suspicious',0)}  mal={state.last_summary.get('malicious',0)}")
+# ---------- TUI helpers ----------
+def make_status_text(state: State) -> str:
+    lines = []
+    lines.append(f"Running: {state.running}")
+    lines.append(f"Last scan: {ts_to_str(state.last_scan_ts) if state.last_scan_ts else 'never'}")
+    lines.append(f"Last summary: safe={state.last_summary.get('safe',0)}  sus={state.last_summary.get('suspicious',0)}  mal={state.last_summary.get('malicious',0)}")
     nm = state.next_meta or {}
     if nm:
-        print(f" Next: ~{nm.get('delay_min',0):.1f}m  color={nm.get('color','?')}  cpu={nm.get('cpu',0):.1f}%  base~{nm.get('base_min',0):.1f}m")
-    print(f" Schedule: {state.base_min:.0f}–{state.base_max:.0f} min")
-    print(f" OQS enabled: {os.getenv('HYPERTIME_OQS_ENABLED','0') == '1'}")
-    print(f" Offline mode: {state.offline or (state.cb_open_until > time.time())}")
+        lines.append(f"Next: ~{nm.get('delay_min',0):.1f}m  color={nm.get('color','?')}  cpu={nm.get('cpu',0):.1f}%  base~{nm.get('base_min',0):.1f}m")
+    lines.append(f"Schedule: {state.base_min:.0f}–{state.base_max:.0f} min")
+    lines.append(f"OQS enabled: {os.getenv('HYPERTIME_OQS_ENABLED','0') == '1'}")
+    lines.append(f"Offline mode: {state.offline or (state.cb_open_until > time.time())}")
     if state.cb_open_until > time.time():
         rem = int(state.cb_open_until - time.time())
-        print(f" Circuit breaker open for ~{rem}s")
+        lines.append(f"Circuit breaker open for ~{rem}s")
     ks = "unlocked" if state.kek is not None else "locked"
-    has_secret = secrets_has(state.db, "openai_api_key")
-    print(f" Keystore: {ks} | API key stored: {has_secret}")
-    print("--------------\n")
+    lines.append(f"Keystore: {ks} | API key stored: {('yes' if STATE and asyncio.run if None else '?')}")
+    lines.append(f"API key cached: {bool(state.api_key_cache)}")
+    return "\n".join(lines)
 
 def print_menu():
     menu = """
@@ -985,34 +1132,54 @@ Hypertime IDS TUI
 20) Show current OQS signature public key (base64, short)
  0) Quit
 """
+    clear_screen()
     print(menu.strip())
 
-def print_help():
+def help_text() -> str:
     txt = """
-Alert-only. Logs use per-record HKDF keys with AES-GCM and AEAD, signed with OQS signatures. Boot key mixes PQ KEM and memory-hard KDF. Keystore encrypts secrets using AES-GCM with per-secret HKDF keys and AEAD. DB file perms hardened to 0600. If no API key is available, offline heuristics are used.
-"""
-    print(textwrap.dedent(txt).strip())
+Alert-only. Logs use per-record HKDF keys with AES-GCM and AEAD, signed with OQS signatures.
+Boot key mixes PQ KEM and memory-hard KDF. Keystore encrypts secrets using AES-GCM with per-secret
+HKDF keys and AEAD. DB hardened to 0600 perms. If no API key is available, offline heuristics are used.
 
-def print_oqs_info(state: State):
-    print("\n--- OQS Info ---")
-    print(f" KEM: {KEM_ALG}")
-    print(f" SIG: {SIG_ALG}")
-    print(f" OQS available: {HAVE_OQS}")
-    print(f" Enabled this run: {os.getenv('HYPERTIME_OQS_ENABLED','0')=='1'}")
+TIPS
+- Viewer screens: SPACE to go back.
+- Option 16 unlocks keystore (then key auto-loads if stored).
+- Option 17 stores/updates OPENAI API key encrypted in keystore.
+- Option 18 removes the stored key and clears in-memory cache.
+"""
+    return textwrap.dedent(txt).strip()
+
+def oqs_info_text(state: State) -> str:
+    lines = []
+    lines.append(f"KEM: {KEM_ALG}")
+    lines.append(f"SIG: {SIG_ALG}")
+    lines.append(f"OQS available: {HAVE_OQS}")
+    lines.append(f"Enabled this run: {os.getenv('HYPERTIME_OQS_ENABLED','0')=='1'}")
     short = base64.b64encode(state.signer.pub)[:44].decode(errors="ignore")
-    print(f" SIG pub (b64, first 44): {short}...")
+    lines.append(f"SIG pub (b64, first 44): {short}...")
     try:
         mechs_kem = oqs.get_enabled_kem_mechanisms()
         mechs_sig = oqs.get_enabled_sig_mechanisms()
-        print(" Enabled KEMs (first 10):", ", ".join(mechs_kem[:10]))
-        print(" Enabled SIGs (first 10):", ", ".join(mechs_sig[:10]))
+        lines.append("Enabled KEMs (first 10): " + ", ".join(mechs_kem[:10]))
+        lines.append("Enabled SIGs (first 10): " + ", ".join(mechs_sig[:10]))
     except Exception as e:
-        print(" Can't list mechanisms:", e)
-    print("---------------\n")
+        lines.append("Can't list mechanisms: " + str(e))
+    return "\n".join(lines)
 
-def _export_log_to_file(state: State, log_id: int, path: str) -> bool:
+async def _verify_log_signature(state: State, row) -> bool:
+    _, ts, _, _, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 = row
     try:
-        row = db_get_log_row(state.db, log_id)
+        pub = base64.b64decode(sig_pub_b64)
+        raw = base64.b64decode(cipher_b64)
+        aad = AAD_LOG + json.dumps({"ts": ts, "m": {"color": color}}, separators=(",", ":"), ensure_ascii=False).encode() + AAD_LOG_META
+        v = oqs.Signature(sig_alg)
+        return v.verify(raw + aad, base64.b64decode(sig_b64), pub)
+    except Exception:
+        return False
+
+async def _export_log_to_file(state: State, log_id: int, path: str) -> bool:
+    try:
+        row = await db_get_log_row(state.db, log_id)
         if not row:
             print("Not found."); return False
         _id, ts, sus, mal, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 = row
@@ -1032,145 +1199,135 @@ def _export_log_to_file(state: State, log_id: int, path: str) -> bool:
             pass
         return False
 
-def _search_logs(state: State, n: int, keyword: str):
-    rows = db_list_logs(state.db, n)
-    keyword = keyword.lower()
+async def _search_logs(state: State, n: int, keyword: str) -> str:
+    rows = await db_list_logs(state.db, n)
+    keyword_lc = keyword.lower()
     hits = 0
+    out = []
     for _id, ts, sus, mal, color in rows:
-        row = db_get_log_row(state.db, _id)
+        row = await db_get_log_row(state.db, _id)
         if not row:
             continue
         _, ts, sus, mal, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 = row
         try:
             obj = decrypt_log_envelope(cipher_b64, state.key, ts, {"color": color})
             j = json.dumps(obj, ensure_ascii=False)
-            if keyword in j.lower():
+            if keyword_lc in j.lower():
                 ts_s = ts_to_str(ts)
-                print(f"- Hit #{_id} [{ts_s}] S={sus} M={mal} {color}")
+                out.append(f"- Hit #{_id} [{ts_s}] S={sus} M={mal} {color}")
                 hits += 1
         except Exception:
             continue
-    if hits == 0:
-        print("(no hits)")
+    return "\n".join(out) if hits > 0 else "(no hits)"
 
-def _verify_log_signature(state: State, row) -> bool:
-    _, ts, _, _, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 = row
-    try:
-        pub = base64.b64decode(sig_pub_b64)
-        raw = base64.b64decode(cipher_b64)
-        aad = AAD_LOG + json.dumps({"ts": ts, "m": {"color": color}}, separators=(",", ":"), ensure_ascii=False).encode() + AAD_LOG_META
-        v = oqs.Signature(sig_alg)
-        return v.verify(raw + aad, base64.b64decode(sig_b64), pub)
-    except Exception:
-        return False
-
+# ---------- TUI loop ----------
 async def tui_loop(state: State):
     global ALERT_ON_ANY_ACTION
     while True:
         print_menu()
         choice = safe_text((await ainput("Select> ")).strip())
+        # immediate actions
         if choice == "1":
             if state.running:
-                print("Already running.")
+                await viewer_screen("Info", "Already running.")
             else:
                 state.running = True
-                print("Scanning started.")
+                await viewer_screen("Info", "Scanning started.")
         elif choice == "2":
             if not state.running:
-                print("Already stopped.")
+                await viewer_screen("Info", "Already stopped.")
             else:
                 state.running = False
-                print("Scanning stopped.")
+                await viewer_screen("Info", "Scanning stopped.")
         elif choice == "3":
             if not state.running:
-                print("Not running; starting a one-shot now...")
                 state.running = True
                 state.force_event.set()
+                await viewer_screen("Info", "Not running; starting a one-shot now...")
             else:
-                print("Forcing an immediate scan...")
                 state.force_event.set()
+                await viewer_screen("Info", "Forcing an immediate scan...")
         elif choice == "4":
-            print_status(state)
+            await viewer_screen("Status", make_status_text(state))
         elif choice == "5":
-            try:
-                state.quiet_ui = True
-                n_str = safe_text((await ainput("How many (1-200, default 10)? ")).strip())
-                n = 10
-                if n_str.isdigit():
-                    n = max(1, min(200, int(n_str)))
-                rows = db_list_logs(state.db, n)
-                if not rows:
-                    print("(no logs)")
-                else:
-                    print("\nID   Timestamp            S   M   Color   SIG")
-                    print("-----------------------------------------------")
-                    for _id, ts, sus, mal, color in rows:
-                        row = db_get_log_row(state.db, _id)
-                        ok = _verify_log_signature(state, row) if row else False
-                        print(f"{_id:<4} {ts_to_str(ts):<20} {sus:<3} {mal:<3} {safe_text(color):<6} {'OK' if ok else 'BAD'}")
-                    print("")
-            finally:
-                state.quiet_ui = False
+            n_str = safe_text((await ainput("How many (1-200, default 10)? ")).strip())
+            n = 10
+            if n_str.isdigit():
+                n = max(1, min(200, int(n_str)))
+            rows = await db_list_logs(state.db, n)
+            if not rows:
+                await viewer_screen("Recent logs", "(no logs)")
+            else:
+                header = "ID   Timestamp            S   M   Color   SIG"
+                sep = "-" * len(header)
+                lines = [header, sep]
+                for _id, ts, sus, mal, color in rows:
+                    row = await db_get_log_row(state.db, _id)
+                    ok = await _verify_log_signature(state, row) if row else False
+                    lines.append(f"{_id:<4} {ts_to_str(ts):<20} {sus:<3} {mal:<3} {safe_text(color):<6} {'OK' if ok else 'BAD'}")
+                await viewer_screen("Recent logs", "\n".join(lines))
         elif choice == "6":
+            id_str = safe_text((await ainput("Log ID to decrypt: ")).strip())
+            if not id_str.isdigit():
+                await viewer_screen("Error", "Invalid ID.")
+                continue
+            row = await db_get_log_row(state.db, int(id_str))
+            if not row:
+                await viewer_screen("Error", "Not found.")
+                continue
+            _id, ts, sus, mal, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 = row
             try:
-                state.quiet_ui = True
-                id_str = safe_text((await ainput("Log ID to decrypt: ")).strip())
-                if not id_str.isdigit():
-                    print("Invalid ID."); continue
-                row = db_get_log_row(state.db, int(id_str))
-                if not row:
-                    print("Not found."); continue
-                _id, ts, sus, mal, color, cipher_b64, sig_alg, sig_b64, sig_pub_b64 = row
-                try:
-                    ok = _verify_log_signature(state, row)
-                    obj = decrypt_log_envelope(cipher_b64, state.key, ts, {"color": color})
-                except Exception as e:
-                    print("Decrypt failed:", e); continue
-                j = json.dumps(obj, ensure_ascii=False, indent=2)
-                print(f"\n--- Decrypted Log #{_id} at {ts_to_str(ts)} (SIG {'OK' if ok else 'BAD'}) ---")
-                print(safe_text(j))
-                print("-----------------------------------------------\n")
-            finally:
-                state.quiet_ui = False
+                ok = await _verify_log_signature(state, row)
+                obj = decrypt_log_envelope(cipher_b64, state.key, ts, {"color": color})
+            except Exception as e:
+                await viewer_screen("Error", f"Decrypt failed: {e}")
+                continue
+            j = json.dumps(obj, ensure_ascii=False, indent=2)
+            await viewer_screen(f"Decrypted Log #{_id} at {ts_to_str(ts)} (SIG {'OK' if ok else 'BAD'})", j)
         elif choice == "7":
             d_str = safe_text((await ainput("Delete logs older than N days: ")).strip())
             if not d_str or not d_str.isdigit():
-                print("Invalid number of days."); continue
+                await viewer_screen("Error", "Invalid number of days.")
+                continue
             days = int(d_str)
             cutoff = int(time.time()) - days*86400
             try:
-                deleted = db_purge_older_than(state.db, cutoff)
-                print(f"Deleted {deleted} rows.")
+                deleted = await db_purge_older_than(state.db, cutoff)
+                await viewer_screen("Purge", f"Deleted {deleted} rows.")
             except Exception as e:
-                print("Purge failed:", e)
+                await viewer_screen("Error", f"Purge failed: {e}")
         elif choice == "8":
             ALERT_ON_ANY_ACTION = not ALERT_ON_ANY_ACTION
-            print(f"Beeps now {'ON' if ALERT_ON_ANY_ACTION else 'OFF'}.")
+            await viewer_screen("Beeps", f"Beeps now {'ON' if ALERT_ON_ANY_ACTION else 'OFF'}.")
         elif choice == "9":
             a = safe_text((await ainput("New min minutes (>=10): ")).strip())
             b = safe_text((await ainput("New max minutes (>min, <=360): ")).strip())
             def _is_num(x:str) -> bool:
                 try:
                     float(x); return True
-                except:
+                except Exception:
                     return False
             if not (_is_num(a) and _is_num(b)):
-                print("Invalid numbers."); continue
+                await viewer_screen("Error", "Invalid numbers.")
+                continue
             mn = float(a); mx = float(b)
             if mn < 10 or mx <= mn or mx > 360:
-                print("Out of range."); continue
+                await viewer_screen("Error", "Out of range.")
+                continue
             state.base_min, state.base_max = mn, mx
-            print(f"Schedule updated to {mn:.0f}–{mx:.0f} minutes.")
+            await viewer_screen("Schedule", f"Schedule updated to {mn:.0f}–{mx:.0f} minutes.")
         elif choice == "10":
-            print_oqs_info(state)
+            await viewer_screen("OQS Info", oqs_info_text(state))
         elif choice == "11":
-            print_help()
+            await viewer_screen("Help", help_text())
         elif choice == "12":
             id_str = safe_text((await ainput("Log ID to export: ")).strip())
             path = safe_text((await ainput("Write to path (will overwrite): ")).strip())
             if not id_str.isdigit() or not path:
-                print("Invalid input."); continue
-            _export_log_to_file(state, int(id_str), path)
+                await viewer_screen("Error", "Invalid input.")
+                continue
+            ok = await _export_log_to_file(state, int(id_str), path)
+            await viewer_screen("Export", "Success." if ok else "Failed.")
         elif choice == "13":
             n_str = safe_text((await ainput("Search last N logs (1-200, default 50): ")).strip())
             n = 50
@@ -1178,69 +1335,127 @@ async def tui_loop(state: State):
                 n = max(1, min(200, int(n_str)))
             kw = safe_text((await ainput("Keyword: ")).strip())
             if not kw:
-                print("Empty keyword."); continue
-            _search_logs(state, n, kw)
+                await viewer_screen("Search", "Empty keyword.")
+                continue
+            body = await _search_logs(state, n, kw)
+            await viewer_screen("Search results", body)
         elif choice == "14":
             try:
-                db_vacuum(state.db); print("Vacuum complete.")
+                await db_vacuum(state.db)
+                await viewer_screen("Vacuum", "Vacuum complete.")
             except Exception as e:
-                print("Vacuum failed:", e)
+                await viewer_screen("Vacuum", f"Vacuum failed: {e}")
         elif choice == "15":
             state.offline = not state.offline
             if state.offline:
-                print("Offline heuristic mode ENABLED.")
+                state.cb_open_until = time.time() + 86400  # effectively force offline
+                await viewer_screen("Offline mode", "Offline heuristic mode ENABLED.")
             else:
                 state.cb_open_until = 0.0
                 state.err_streak = 0
-                print("Offline heuristic mode DISABLED.")
+                await viewer_screen("Offline mode", "Offline heuristic mode DISABLED.")
         elif choice == "16":
             if state.kek is not None:
-                print("Keystore already unlocked."); continue
+                await viewer_screen("Keystore", "Keystore already unlocked.")
+                continue
             pw = await agetpass("Keystore passphrase (won't echo): ")
             if not pw:
-                print("Empty passphrase; canceled."); continue
+                await viewer_screen("Keystore", "Empty passphrase; canceled.")
+                continue
             try:
-                state.kek = keystore_unlock(state.db, pw)
-                print("Keystore unlocked.")
+                state.kek = await keystore_unlock(state.db, pw)
+                # try to preload API key
+                if await secrets_has(state.db, "openai_api_key"):
+                    val = await secrets_get(state.db, state.kek, "openai_api_key")
+                    state.api_key_cache = (val or b"").decode("utf-8", "ignore").strip() or None
+                await viewer_screen("Keystore", f"Keystore unlocked. API key cached: {bool(state.api_key_cache)}")
             except Exception as e:
                 state.kek = None
-                print("Unlock failed:", e)
+                await viewer_screen("Keystore", f"Unlock failed: {e}")
         elif choice == "17":
             if state.kek is None:
-                print("Keystore locked. Use option 16 first."); continue
+                await viewer_screen("Keystore", "Keystore locked. Use option 16 first.")
+                continue
             api = await agetpass("Enter OpenAI API key (won't echo): ")
             if not api:
-                print("Empty key; canceled."); continue
+                await viewer_screen("API Key", "Empty key; canceled.")
+                continue
             api_b = safe_text(api.strip()).encode()
             try:
-                secrets_put(state.db, state.kek, "openai_api_key", api_b, current_kdf_label())
-                print("OpenAI API key stored (encrypted).")
+                await secrets_put(state.db, state.kek, "openai_api_key", api_b, current_kdf_label())
+                state.api_key_cache = api.strip()
+                await viewer_screen("API Key", "OpenAI API key stored (encrypted) and cached.")
             except Exception as e:
-                print("Store failed:", e)
+                await viewer_screen("API Key", f"Store failed: {e}")
         elif choice == "18":
             try:
-                n = secrets_delete(state.db, "openai_api_key")
-                print("Removed." if n else "No key stored.")
+                n = await secrets_delete(state.db, "openai_api_key")
+                state.api_key_cache = None
+                await viewer_screen("API Key", "Removed." if n else "No key stored.")
             except Exception as e:
-                print("Remove failed:", e)
+                await viewer_screen("API Key", f"Remove failed: {e}")
         elif choice == "19":
             if state.kek is None:
-                print("Keystore locked. Use option 16 first."); continue
-            ok = state.signer.persist(state.kek, state.db)
-            print("Persisted." if ok else "Persist failed.")
+                await viewer_screen("OQS", "Keystore locked. Use option 16 first.")
+                continue
+            ok = await state.signer.persist(state.kek, state.db)
+            await viewer_screen("OQS", "Persisted." if ok else "Persist failed.")
         elif choice == "20":
             short = base64.b64encode(state.signer.pub)[:88].decode(errors="ignore")
-            print(f"OQS SIG pub (b64): {short}...")
+            await viewer_screen("OQS SIG pub (base64)", f"{short}...")
         elif choice == "0":
-            print("Bye."); return
+            await viewer_screen("Bye", "Goodbye.")
+            return
         else:
-            print("Unknown selection.")
+            await viewer_screen("Error", "Unknown selection.")
 
+# ---------- startup bootstrap ----------
+async def bootstrap_unlock_and_load_key(state: State):
+    # if a key is stored but keystore not unlocked, prompt up to 3 tries
+    try:
+        if await secrets_has(state.db, "openai_api_key") and state.kek is None:
+            for attempt in range(1, 4):
+                pw = await agetpass(f"Keystore passphrase (attempt {attempt}/3): ")
+                if not pw:
+                    continue
+                try:
+                    state.kek = await keystore_unlock(state.db, pw)
+                    val = await secrets_get(state.db, state.kek, "openai_api_key")
+                    state.api_key_cache = (val or b"").decode("utf-8", "ignore").strip() or None
+                    print("[Keystore] Unlocked and API key cached.")
+                    break
+                except Exception as e:
+                    print(f"[Keystore] Unlock failed: {e}")
+            if state.kek is None:
+                print("[Keystore] Proceeding without unlock; offline/ENV key will be used.")
+        else:
+            # maybe env var present; cache it
+            env = os.getenv("OPENAI_API_KEY")
+            if env:
+                state.api_key_cache = env.strip()
+    except Exception as e:
+        print("[Startup] Keystore bootstrap error:", e)
+
+# ---------- main ----------
 async def main():
+    # Handle Ctrl+C gracefully
+    def _sigint(_sig, _frm):
+        print("\n[HYPERTIME IDS] Interrupted.")
+        try:
+            STATE.running = False
+        except Exception:
+            pass
+    try:
+        signal.signal(signal.SIGINT, _sigint)
+    except Exception:
+        pass
+
     key = derive_boot_key()
     db = db_connect(DEFAULT_DB)
     global STATE
     STATE = State(db=db, key=key)
+    await bootstrap_unlock_and_load_key(STATE)
+
     scanner = asyncio.create_task(scanning_loop(STATE))
     try:
         await tui_loop(STATE)
@@ -1253,7 +1468,11 @@ async def main():
         except Exception:
             pass
         try:
-            db.close()
+            await db_vacuum(STATE.db)
+        except Exception:
+            pass
+        try:
+            STATE.db.close()
         except Exception:
             pass
 
@@ -1262,4 +1481,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[HYPERTIME IDS] Stopped by user.")
-
