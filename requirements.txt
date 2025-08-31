@@ -1,1 +1,6 @@
-# To ensure app dependencies are ported from your virtual environment/host machine into your container, run 'pip freeze > requirements.txt' in the terminal to overwrite this file
+psutil==7.0.0
+httpx[http2]==0.28.1
+bleach==6.2.0
+jsonschema==4.25.1
+cryptography==45.0.6
+liboqs-python==0.12.0
